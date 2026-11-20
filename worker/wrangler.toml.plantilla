@@ -1,0 +1,15 @@
+# Lo completa el workflow «Instalar Kumo Predice» con tus datos. No edites a mano.
+# Nombre propio: no pisa la nube de Kumo si la tienes en la misma cuenta de Cloudflare.
+name = "kumo-predice"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "KUMO"
+id = "__KV_ID__"
+
+# Workers AI: la IA de tu propia cuenta (gratis, sin clave). Si el token no lo permite,
+# instalar.yml quita este bloque y despliega igual.
+[ai]
+binding = "AI"

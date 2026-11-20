@@ -1,0 +1,137 @@
+name: Ciclo Kumo Predice
+
+# Un ciclo cada 30 min. GitHub cobra cada ciclo por minuto entero: el ciclo está hecho
+# para durar menos de 1 min (IA con tope de 30 s y entorno guardado). En un repo público
+# los minutos son gratis e ilimitados; en uno privado son ~1 440 de los 2 000 del mes.
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [kumo-ciclo]
+
+concurrency:
+  group: kumo-ciclo
+  cancel-in-progress: false
+
+jobs:
+  ciclo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ¿Está instalado?
+        id: inst
+        run: |
+          if [ -f kumo.json ]; then echo "ok=1" >> "$GITHUB_OUTPUT"; else echo "Kumo aún no está instalado: ejecuta «Instalar Kumo»."; fi
+
+      - uses: actions/setup-python@v5
+        id: py
+        if: steps.inst.outputs.ok
+        with:
+          python-version: "3.12"
+
+      # Entorno con ccxt ya instalado, guardado entre ciclos: ahorra ~10 s por ciclo.
+      - uses: actions/cache@v4
+        id: venv
+        if: steps.inst.outputs.ok
+        with:
+          path: ~/.venv-kumo
+          key: venv-${{ runner.os }}-${{ steps.py.outputs.python-version }}-${{ hashFiles('runner/requirements.txt') }}
+
+      - name: Dependencias
+        if: steps.inst.outputs.ok && steps.venv.outputs.cache-hit != 'true'
+        run: |
+          python -m venv ~/.venv-kumo
+          ~/.venv-kumo/bin/pip install -q -r runner/requirements.txt
+
+      # FreeLLMAPI: tu router de IA corre aquí mismo, en cada ciclo, solo en 127.0.0.1 (nunca
+      # expuesto a internet) y sin claves: usa los proveedores gratuitos sin cuenta y su
+      # catálogo firmado. Su base (catálogo y estadísticas del router) se guarda un día en
+      # caché. Si no arranca, el ciclo sigue con Workers AI y los demás. Apágalo con el
+      # secreto FREELLMAPI=no; agrega claves tuyas con FREELLMAPI_CLAVES (JSON).
+      - name: Día (caché de FreeLLMAPI)
+        id: dia
+        if: steps.inst.outputs.ok
+        run: echo "hoy=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache/restore@v4
+        if: steps.inst.outputs.ok
+        with:
+          path: ~/freellmapi-data
+          key: freellmapi-v1-${{ steps.dia.outputs.hoy }}
+          restore-keys: freellmapi-v1-
+
+      - name: FreeLLMAPI
+        id: fl
+        if: steps.inst.outputs.ok
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          APAGADO: ${{ secrets.FREELLMAPI }}
+          CLAVES: ${{ secrets.FREELLMAPI_CLAVES }}
+          RUN: ${{ secrets.KUMO_RUNNER_TOKEN }}
+          IMAGEN: ${{ vars.FREELLMAPI_IMAGEN || 'ghcr.io/tashfeenahmed/freellmapi:v0.16.36' }}
+        run: |
+          [ "$APAGADO" = "no" ] && { echo "FreeLLMAPI apagado (secreto FREELLMAPI=no)"; exit 0; }
+          mkdir -p ~/freellmapi-data
+          # Llave de cifrado estable (sale de tu token del runner): la base en caché queda cifrada.
+          llave=$(printf 'freellmapi:%s' "$RUN" | sha256sum | cut -c1-64)
+          # Proveedores gratuitos sin cuenta + tus claves (opcional, JSON [{"platform":"groq","key":"gsk_…"}]).
+          config=$(python3 - <<'PY'
+          import json, os
+          sin = ["kilo", "ovh", "aihorde", "halx", "aisense", "keenable", "parallel"]
+          keys = [{"platform": p, "label": "anonimo"} for p in sin]
+          try:
+              keys += [k for k in json.loads(os.environ.get("CLAVES") or "[]") if k.get("platform") and k.get("key")]
+          except ValueError:
+              print("::warning::FREELLMAPI_CLAVES no es un JSON válido: se ignora", flush=True)
+          print(json.dumps({"keys": keys, "routing": {"strategy": "balanced"}}))
+          PY
+          )
+          docker run -d --name freellmapi --network host --user "$(id -u):$(id -g)" \
+            -e HOST=127.0.0.1 -e PORT=31415 -e NODE_ENV=production -e ENCRYPTION_KEY="$llave" \
+            -e FREEAPI_CONFIG_JSON="$config" -e FREEAPI_DB_PATH=/datos/freeapi.db \
+            -v "$HOME/freellmapi-data:/datos" "$IMAGEN" >/dev/null
+          for i in $(seq 1 60); do
+            c=$(curl -s -o /dev/null -m 2 -w '%{http_code}' http://127.0.0.1:31415/v1/models || true)
+            [ "$c" != "000" ] && break; sleep 1
+          done
+          [ "$c" != "000" ] || { docker logs freellmapi 2>&1 | tail -20; echo "::warning::FreeLLMAPI no arrancó: el ciclo usa Workers AI y los demás"; exit 0; }
+          # Primera vez (sin caché): espera a que baje su catálogo de modelos (~15 s).
+          for i in $(seq 1 45); do
+            v=$(python3 -c "import sqlite3,os;print((sqlite3.connect(os.path.expanduser('~/freellmapi-data/freeapi.db')).execute(\"select value from settings where key='catalog_applied_version'\").fetchone() or [''])[0])" 2>/dev/null || true)
+            [ -n "$v" ] && break; sleep 1
+          done
+          clave=$(python3 -c "import sqlite3,os;print(sqlite3.connect(os.path.expanduser('~/freellmapi-data/freeapi.db')).execute(\"select value from settings where key='unified_api_key'\").fetchone()[0])")
+          echo "::add-mask::$clave"
+          echo "FreeLLMAPI listo (catálogo ${v:-sin bajar todavía})"
+          { echo "url=http://127.0.0.1:31415/v1"; echo "clave=$clave"; } >> "$GITHUB_OUTPUT"
+
+      - name: Ejecutar ciclo
+        if: steps.inst.outputs.ok
+        env:
+          FREELLMAPI_URL: ${{ steps.fl.outputs.url }}
+          FREELLMAPI_CLAVE: ${{ steps.fl.outputs.clave }}
+          KUMO_RUNNER_TOKEN: ${{ secrets.KUMO_RUNNER_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          IA_URL: ${{ secrets.IA_URL }}
+          IA_MODELOS: ${{ secrets.IA_MODELOS }}
+          IA_CLAVE: ${{ secrets.IA_CLAVE }}
+          EXCHANGE_ID: ${{ secrets.EXCHANGE_ID }}
+          EXCHANGE_API_KEY: ${{ secrets.EXCHANGE_API_KEY }}
+          EXCHANGE_SECRET: ${{ secrets.EXCHANGE_SECRET }}
+          EXCHANGE_PASSWORD: ${{ secrets.EXCHANGE_PASSWORD }}
+        run: ~/.venv-kumo/bin/python runner/agente.py
+
+      - name: Detener FreeLLMAPI
+        if: always() && steps.fl.outputs.url
+        run: docker stop -t 5 freellmapi >/dev/null || true
+
+      - uses: actions/cache/save@v4
+        if: always() && steps.fl.outputs.url
+        continue-on-error: true
+        with:
+          path: ~/freellmapi-data
+          key: freellmapi-v1-${{ steps.dia.outputs.hoy }}
